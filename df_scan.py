@@ -1,16 +1,20 @@
 import json
 import math
 import os
+import statistics
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 import requests
 
-# ===================== 基礎設定（純 Garena 實價源） =====================
+# ===================== 基礎設定（純 Garena 實價 + 1W/1M 漏斗分析） =====================
 DASHBOARD_API_URL = "https://app.852941.xyz/api/dashboard"
-TAX_RATE = 0.135  # 實測含上架費與成交稅約 13.5%（保守高於 13%）
+PRICE_API_URL = "https://app.852941.xyz/api/price"
+TAX_RATE = 0.135  # 實測含上架費與成交稅約 13.5%
 NET_MULTIPLIER = 1.0 - TAX_RATE  # 0.865
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+MAX_DEEP_DIVE_BULLETS = 10  # 漏斗上限：最多只深挖前 10 款候選彈，保護站方伺服器
 
 HEADERS = {
     "User-Agent": (
@@ -78,7 +82,6 @@ def fetch_garena_dashboard() -> list[dict]:
             level = safe_int(item.get("tier"))
             stack_size = safe_int(item.get("stack_size"), 60)
 
-            # 採用 72 小時 P85 作為實戰保守賣價（若缺值依序降級）
             target_sell = (
                 safe_float(item.get("p85_72h"))
                 or safe_float(item.get("p85_7d"))
@@ -88,13 +91,10 @@ def fetch_garena_dashboard() -> list[dict]:
             )
 
             breakeven_sell = math.ceil(price / NET_MULTIPLIER)
-
-            # 嚴格依 13.5% 稅後計算每發淨利與 ROI（單格利潤一併算好供 AI 參考）
             est_net_profit = round(target_sell * NET_MULTIPLIER - price, 1)
             est_net_roi_pct = round((est_net_profit / price) * 100, 1) if price > 0 else 0.0
             profit_per_slot = round(est_net_profit * stack_size, 0)
 
-            # 估算近 7 日常態均價（結合 12h/24h/3d/7d 與 72h P70）
             ref_prices = [
                 v for v in (
                     safe_float(item.get("price_12h")),
@@ -137,13 +137,149 @@ def fetch_garena_dashboard() -> list[dict]:
                 "safety_warning": str(item.get("safety_warning") or ""),
                 "restock_in_hours": safe_float(item.get("restock_in_hours"), -99.0),
                 "trade_score": safe_float(item.get("trade_score")),
+                # 深挖欄位預設值
+                "buy_window": "",
+                "sell_window": "",
+                "trend_30d_pct": 0.0,
+                "trend_tag": "橫盤",
             })
 
     print(f"✅ 成功讀取 {len(enriched)} 款 Garena 彈藥即時行情。\n", flush=True)
     return enriched
 
 
-# ===================== 2. Cloudflare KV 寫入工具 =====================
+# ===================== 2. 漏斗深挖：拉取 1W/1M 並清洗 OCR 毛刺 =====================
+def fetch_clean_series(session: requests.Session, bullet_name: str, mode: str) -> list[tuple[datetime, float]]:
+    try:
+        res = session.get(
+            PRICE_API_URL,
+            params={"bullet_name": bullet_name, "mode": mode},
+            headers=HEADERS,
+            timeout=(8, 20),
+        )
+        if res.status_code != 200:
+            return []
+        raw_list = res.json().get("data") or []
+    except Exception as e:
+        print(f"  ⚠️ 拉取 [{bullet_name}] ({mode}) 失敗：{e}", flush=True)
+        return []
+
+    parsed = []
+    for row in raw_list:
+        if not isinstance(row, dict):
+            continue
+        p = safe_float(row.get("price"))
+        ts_str = str(row.get("created_at") or "").strip()
+        if p <= 0 or not ts_str:
+            continue
+        try:
+            dt = datetime.strptime(ts_str[:19], "%Y-%m-%d %H:%M:%S")
+            parsed.append((dt, p))
+        except ValueError:
+            continue
+
+    if len(parsed) < 5:
+        return parsed
+
+    # 依中位數過濾 OCR 異常爆衝毛刺（如 33327）
+    med = statistics.median([p for _, p in parsed])
+    low_bound = med * 0.30
+    high_bound = med * 2.80
+    cleaned = [(dt, p) for dt, p in parsed if low_bound <= p <= high_bound]
+    cleaned.sort(key=lambda x: x[0])
+    return cleaned
+
+
+def compute_1w_timing(points: list[tuple[datetime, float]]) -> tuple[str, str, float]:
+    if len(points) < 24:
+        return "", "", 0.0
+
+    hour_buckets: dict[int, list[float]] = {}
+    for dt, p in points:
+        hour_buckets.setdefault(dt.hour, []).append(p)
+
+    hour_avgs = {h: sum(vals) / len(vals) for h, vals in hour_buckets.items() if vals}
+    if len(hour_avgs) < 6:
+        return "", "", 0.0
+
+    # 以連續 2 小時滑動視窗找出「最低買進區間」與「最高出貨區間」
+    window_avgs = {}
+    for h in range(24):
+        h_next = (h + 1) % 24
+        vals = []
+        if h in hour_avgs:
+            vals.append(hour_avgs[h])
+        if h_next in hour_avgs:
+            vals.append(hour_avgs[h_next])
+        if vals:
+            window_avgs[h] = sum(vals) / len(vals)
+
+    best_buy_h = min(window_avgs, key=window_avgs.get)
+    best_sell_h = max(window_avgs, key=window_avgs.get)
+
+    buy_win = f"{best_buy_h:02d}-{(best_buy_h + 2) % 24:02d}"
+    sell_win = f"{best_sell_h:02d}-{(best_sell_h + 2) % 24:02d}"
+    clean_avg = round(sum(p for _, p in points) / len(points), 1)
+    return buy_win, sell_win, clean_avg
+
+
+def compute_1m_trend(points: list[tuple[datetime, float]]) -> tuple[float, str]:
+    if len(points) < 20:
+        return 0.0, "橫盤"
+
+    prices = [p for _, p in points]
+    n = len(prices)
+    early_med = statistics.median(prices[: max(5, int(n * 0.55))])
+    recent_med = statistics.median(prices[max(0, int(n * 0.75)) :])
+
+    if early_med <= 0:
+        return 0.0, "橫盤"
+
+    trend_pct = round(((recent_med - early_med) / early_med) * 100, 1)
+    if trend_pct <= -10.0:
+        label = "陰跌"
+    elif trend_pct >= 10.0:
+        label = "上漲"
+    else:
+        label = "橫盤"
+    return trend_pct, label
+
+
+def enrich_candidates_with_history(candidates: list[dict]):
+    unique_map = {}
+    for item in candidates:
+        if item["name"] not in unique_map and len(unique_map) < MAX_DEEP_DIVE_BULLETS:
+            unique_map[item["name"]] = item
+
+    print(f"🔎 啟動漏斗深挖：針對 Top {len(unique_map)} 候選彈拉取 1W / 1M 歷史曲線...", flush=True)
+    session = requests.Session()
+
+    for idx, (name, item) in enumerate(unique_map.items(), 1):
+        pts_1w = fetch_clean_series(session, name, "1w")
+        time.sleep(0.35)
+        pts_1m = fetch_clean_series(session, name, "1m")
+        time.sleep(0.35)
+
+        buy_win, sell_win, clean_1w_avg = compute_1w_timing(pts_1w)
+        trend_pct, trend_tag = compute_1m_trend(pts_1m)
+
+        item["buy_window"] = buy_win
+        item["sell_window"] = sell_win
+        item["trend_30d_pct"] = trend_pct
+        item["trend_tag"] = trend_tag
+        if clean_1w_avg > 0:
+            item["est_avg"] = clean_1w_avg
+            item["vs_avg_pct"] = round(((item["price"] - clean_1w_avg) / clean_1w_avg) * 100, 1)
+
+        print(
+            f"  [{idx:02d}/{len(unique_map):02d}] {name} ➔ "
+            f"買窗 {buy_win or '-'} / 賣窗 {sell_win or '-'} ｜ 月線 {trend_tag} ({trend_pct:+.1f}%)",
+            flush=True,
+        )
+    print("", flush=True)
+
+
+# ===================== 3. Cloudflare KV 寫入工具 =====================
 def kv_put_json(key: str, data) -> bool:
     account_id = os.environ.get("CF_ACCOUNT_ID")
     namespace_id = os.environ.get("CF_KV_NAMESPACE_ID")
@@ -166,15 +302,15 @@ def kv_put_json(key: str, data) -> bool:
     return False
 
 
-# ===================== 3. 量化篩選 + Gemini 操盤報告 =====================
+# ===================== 4. 量化篩選 + Gemini 操盤報告 =====================
 def build_fallback_report(flip_top: list, self_use_top: list, sell_top: list, now_tw: datetime) -> dict:
     return {
         "updated_at": int(now_tw.timestamp()),
         "updated_str": now_tw.strftime("%Y-%m-%d %H:%M"),
-        "source": "Garena 實價量化模型（備援）",
+        "source": "Garena 1W/1M 量化模型（備援）",
         "market_summary": (
             f"台灣時間 {WEEKDAY_ZH[now_tw.weekday()]} {now_tw.strftime('%H:%M')}。"
-            "已依 Garena 實價與 72 小時 P85 賣價扣除 13.5% 手續費完成篩選。"
+            "已結合 Garena 實價、1週時段規律與 1月趨勢（扣除 13.5% 手續費）完成篩選。"
         ),
         "flip_picks": [
             {
@@ -183,7 +319,10 @@ def build_fallback_report(flip_top: list, self_use_top: list, sell_top: list, no
                 "buy_price": x["price"],
                 "target_sell": x["target_sell"],
                 "roi_pct": x["est_net_roi_pct"],
-                "reason": f"72h 水位 {x['position_72h']}%、回彈 {x['bounces_72h']} 次，扣稅後每格約賺 {int(x['profit_per_slot'])}。",
+                "buy_window": x.get("buy_window", ""),
+                "sell_window": x.get("sell_window", ""),
+                "trend_tag": x.get("trend_tag", "橫盤"),
+                "reason": f"月線{x.get('trend_tag', '橫盤')}，72h 回彈 {x['bounces_72h']} 次，單格扣稅淨利約 {int(x['profit_per_slot'])}。",
             }
             for x in flip_top[:4]
         ],
@@ -193,7 +332,9 @@ def build_fallback_report(flip_top: list, self_use_top: list, sell_top: list, no
                 "level": x["level"],
                 "buy_price": x["price"],
                 "discount_pct": round(abs(min(x["vs_avg_pct"], 0.0)), 1),
-                "reason": f"72h 水位僅 {x['position_72h']}%，低於均價 {abs(min(x['vs_avg_pct'], 0.0))}%，自用免稅省很大。",
+                "buy_window": x.get("buy_window", ""),
+                "trend_tag": x.get("trend_tag", "橫盤"),
+                "reason": f"低於週均價 {abs(min(x['vs_avg_pct'], 0.0))}%，自用免 13.5% 賣出稅。",
             }
             for x in self_use_top[:4]
         ],
@@ -202,21 +343,22 @@ def build_fallback_report(flip_top: list, self_use_top: list, sell_top: list, no
                 "name": x["name"],
                 "level": x["level"],
                 "sell_price": x["price"],
-                "reason": f"72h 水位高達 {x['position_72h']}%（高於均價 +{max(x['vs_avg_pct'], 0.0)}%），適合逢高出清。",
+                "sell_window": x.get("sell_window", ""),
+                "trend_tag": x.get("trend_tag", "橫盤"),
+                "reason": f"72h 水位 {x['position_72h']}% 處高檔，建議趁高價時段分批出貨。",
             }
             for x in sell_top[:4]
         ],
-        "risk_note": "已計入約 13.5% 上架與成交稅；若標示波動偏高或即將系統補貨，請分批掛單避免壓價。",
+        "risk_note": "已濾除歷史異常爆衝值並計入 13.5% 稅率；標記「陰跌」者慎防接飛刀，請分批掛單。",
     }
 
 
 def generate_ai_report(enriched: list[dict], now_tw: datetime) -> dict:
-    # 聚焦實戰主流 Lv.3 ~ Lv.6 子彈
     tradable = [x for x in enriched if x["level"] >= 3 and x["price"] >= 100]
     if not tradable:
         tradable = enriched
 
-    # 1. 抄底倒賣候選：嚴格要求扣 13.5% 稅後淨利 > 0 且位於 72h 中低位
+    # 第一關初篩
     flip_candidates = [
         x for x in tradable
         if x["est_net_roi_pct"] >= 2.5
@@ -229,16 +371,11 @@ def generate_ai_report(enriched: list[dict], now_tw: datetime) -> dict:
             if x["est_net_roi_pct"] > 0.5 and x["position_72h"] <= 55.0
         ]
     flip_candidates.sort(
-        key=lambda x: (
-            1 if x["safety_gate"] == "PASS" else 0,
-            x["est_net_roi_pct"],
-            x["profit_per_slot"],
-        ),
+        key=lambda x: (1 if x["safety_gate"] == "PASS" else 0, x["est_net_roi_pct"], x["profit_per_slot"]),
         reverse=True,
     )
-    flip_candidates = flip_candidates[:8]
+    flip_candidates = flip_candidates[:5]
 
-    # 2. 自用囤貨候選：優先挑 Lv.4~6 或明顯跌破均價／處於 72h 低檔區（免賣出稅）
     self_use_candidates = [
         x for x in tradable
         if x["level"] >= 4 and (x["vs_avg_pct"] <= -5.0 or x["position_72h"] <= 20.0)
@@ -249,15 +386,27 @@ def generate_ai_report(enriched: list[dict], now_tw: datetime) -> dict:
             if x["vs_avg_pct"] <= -5.0 or x["position_72h"] <= 20.0
         ]
     self_use_candidates.sort(key=lambda x: (x["vs_avg_pct"], x["position_72h"]))
-    self_use_candidates = self_use_candidates[:8]
+    self_use_candidates = self_use_candidates[:4]
 
-    # 3. 逢高出清候選：位於 72h/24h 高檔區（>= 80%）且高於均價
     sell_candidates = [
         x for x in tradable
         if x["position_72h"] >= 80.0 or (x["position_24h"] >= 88.0 and x["vs_avg_pct"] >= 5.0)
     ]
     sell_candidates.sort(key=lambda x: (x["position_72h"], x["vs_avg_pct"]), reverse=True)
-    sell_candidates = sell_candidates[:8]
+    sell_candidates = sell_candidates[:4]
+
+    # 第二關：只針對初篩出的核心候選彈拉取 1W/1M 計算黃金買賣時段與月線方向
+    enrich_candidates_with_history(flip_candidates + self_use_candidates + sell_candidates)
+
+    # 倒賣排序二次保護：把 30 天「陰跌」標的往後排，優先推橫盤/上漲
+    flip_candidates.sort(
+        key=lambda x: (
+            0 if x.get("trend_tag") == "陰跌" else 1,
+            1 if x["safety_gate"] == "PASS" else 0,
+            x["est_net_roi_pct"],
+        ),
+        reverse=True,
+    )
 
     fallback = build_fallback_report(flip_candidates, self_use_candidates, sell_candidates, now_tw)
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -268,15 +417,16 @@ def generate_ai_report(enriched: list[dict], now_tw: datetime) -> dict:
     prompt = (
         f"你是《三角洲行動 (Delta Force)》Garena 服拍賣行彈藥操盤分析師。"
         f"目前台灣時間：{now_tw.strftime('%Y-%m-%d %H:%M')}（{WEEKDAY_ZH[now_tw.weekday()]}）。\n"
-        f"以下皆為 Garena 實價大盤計算出的候選數據（目標賣價為 72 小時 P85 價，已扣除 13.5% 手續費，含回彈次數 bounces_72h、流通度 turnover、安全風控 safety_gate 與系統補貨倒數 restock_in_hours）。\n"
-        f"請嚴格根據以下數據產出精煉的繁體中文 JSON 報告，絕不捏造數據外的子彈或價格；每個標的的 reason 控制在 40 字以內、直講關鍵重點：\n\n"
-        f"【候選 1：抄底倒賣（扣 13.5% 稅仍有正利潤）】\n{json.dumps(flip_candidates, ensure_ascii=False)}\n\n"
-        f"【候選 2：自用抄底囤貨（低於均價或處於 72h 低點、免賣出稅）】\n{json.dumps(self_use_candidates, ensure_ascii=False)}\n\n"
-        f"【候選 3：逢高出清警戒（72h 高位）】\n{json.dumps(sell_candidates, ensure_ascii=False)}\n\n"
+        f"以下皆為 Garena 實價 + 1W 黃金買賣時段 (buy_window/sell_window) + 1M 趨勢 (trend_tag/trend_30d_pct) 計算出的精準數據（已扣除 13.5% 稅率並清洗異常值）。\n"
+        f"請嚴格根據以下數據產出精煉的繁體中文 JSON 報告，絕不捏造數據外的子彈、價格或時段；每個 reason 控制在 35 字以內：\n\n"
+        f"【候選 1：抄底倒賣】\n{json.dumps(flip_candidates, ensure_ascii=False)}\n\n"
+        f"【候選 2：自用抄底囤貨】\n{json.dumps(self_use_candidates, ensure_ascii=False)}\n\n"
+        f"【候選 3：逢高出清警戒】\n{json.dumps(sell_candidates, ensure_ascii=False)}\n\n"
         f"規則：\n"
-        f"1. 各分類挑選最值得操作的 3～4 款（若候選為空則回傳 []）。\n"
-        f"2. 倒賣優先挑 safety_gate=PASS、回彈次數高且單格利潤佳的標的；若為 CAUTION 或 restock_in_hours 在 0~2 小時內，請在 reason 簡短提醒。\n"
-        f"3. discount_pct 請填寫正數百分比（取 vs_avg_pct 的絕對折價幅，若未低於均價則填 0）。"
+        f"1. 各分類挑選最值得操作的 3 款（若候選不足則全列，空則 []）。\n"
+        f"2. buy_window、sell_window、trend_tag 請直接沿用輸入數據中的值（無則填空字串）。\n"
+        f"3. 倒賣優先避開 trend_tag='陰跌' 的標的；若不得不列或 safety_gate='CAUTION'，請在 reason 簡短提醒。\n"
+        f"4. discount_pct 填寫正數折價百分比（若 vs_avg_pct >= 0 則填 0）。"
     )
 
     schema = {
@@ -293,9 +443,15 @@ def generate_ai_report(enriched: list[dict], now_tw: datetime) -> dict:
                         "buy_price": {"type": "NUMBER"},
                         "target_sell": {"type": "NUMBER"},
                         "roi_pct": {"type": "NUMBER"},
+                        "buy_window": {"type": "STRING"},
+                        "sell_window": {"type": "STRING"},
+                        "trend_tag": {"type": "STRING"},
                         "reason": {"type": "STRING"},
                     },
-                    "required": ["name", "level", "buy_price", "target_sell", "roi_pct", "reason"],
+                    "required": [
+                        "name", "level", "buy_price", "target_sell", "roi_pct",
+                        "buy_window", "sell_window", "trend_tag", "reason",
+                    ],
                 },
             },
             "self_use_picks": {
@@ -307,9 +463,14 @@ def generate_ai_report(enriched: list[dict], now_tw: datetime) -> dict:
                         "level": {"type": "INTEGER"},
                         "buy_price": {"type": "NUMBER"},
                         "discount_pct": {"type": "NUMBER"},
+                        "buy_window": {"type": "STRING"},
+                        "trend_tag": {"type": "STRING"},
                         "reason": {"type": "STRING"},
                     },
-                    "required": ["name", "level", "buy_price", "discount_pct", "reason"],
+                    "required": [
+                        "name", "level", "buy_price", "discount_pct",
+                        "buy_window", "trend_tag", "reason",
+                    ],
                 },
             },
             "sell_picks": {
@@ -320,9 +481,13 @@ def generate_ai_report(enriched: list[dict], now_tw: datetime) -> dict:
                         "name": {"type": "STRING"},
                         "level": {"type": "INTEGER"},
                         "sell_price": {"type": "NUMBER"},
+                        "sell_window": {"type": "STRING"},
+                        "trend_tag": {"type": "STRING"},
                         "reason": {"type": "STRING"},
                     },
-                    "required": ["name", "level", "sell_price", "reason"],
+                    "required": [
+                        "name", "level", "sell_price", "sell_window", "trend_tag", "reason",
+                    ],
                 },
             },
             "risk_note": {"type": "STRING"},
@@ -360,8 +525,8 @@ def generate_ai_report(enriched: list[dict], now_tw: datetime) -> dict:
         report = json.loads(raw_text)
         report["updated_at"] = int(now_tw.timestamp())
         report["updated_str"] = now_tw.strftime("%Y-%m-%d %H:%M")
-        report["source"] = f"Garena 實價 + Gemini ({GEMINI_MODEL})"
-        print("🤖 Gemini Garena 操盤報告產出成功！", flush=True)
+        report["source"] = f"Garena 實價 + 1W/1M 時段模型 ({GEMINI_MODEL})"
+        print("🤖 Gemini Garena 時段操盤報告產出成功！", flush=True)
         return report
 
     except Exception as e:
