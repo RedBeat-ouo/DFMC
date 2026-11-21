@@ -1,20 +1,26 @@
 import json
 import math
 import os
-import re
 import sys
-import time
 from datetime import datetime, timedelta, timezone
 
-from playwright.sync_api import sync_playwright
 import requests
 
-# ===================== 基礎設定 =====================
-BASE_AMMO_URL = "https://deltaforcetools.gg/tw/auction-house/ammo"
-TAX_RATE = 0.13  # 三角洲行動拍賣行約 13% 手續費（含上架費與成交稅）
-NET_MULTIPLIER = 1.0 - TAX_RATE  # 0.87
-MAX_HISTORY_POINTS = 360  # 每 2 小時 1 筆 × 30 天 = 360 筆
+# ===================== 基礎設定（純 Garena 實價源） =====================
+DASHBOARD_API_URL = "https://app.852941.xyz/api/dashboard"
+TAX_RATE = 0.135  # 實測含上架費與成交稅約 13.5%（保守高於 13%）
+NET_MULTIPLIER = 1.0 - TAX_RATE  # 0.865
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Referer": "https://app.852941.xyz/",
+}
 
 WEEKDAY_ZH = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
 
@@ -23,366 +29,129 @@ def get_tw_now() -> datetime:
     return datetime.now(timezone(timedelta(hours=8)))
 
 
-def parse_number(text: str) -> float:
-    s = str(text or "").strip().replace(",", "")
-    negative = ("▼" in s or "↓" in s or s.startswith("-"))
-    cleaned = re.sub(r"[^0-9.]", "", s)
-    if not cleaned:
-        return 0.0
+def safe_float(val, default: float = 0.0) -> float:
     try:
-        val = float(cleaned)
-        return -val if negative else val
-    except ValueError:
-        return 0.0
+        if val is None:
+            return default
+        return float(val)
+    except (ValueError, TypeError):
+        return default
 
 
-def parse_change_cell(text: str) -> tuple[float, bool]:
-    s = str(text or "").strip()
-    is_pct = "%" in s
-    val = parse_number(s)
-    return val, is_pct
+def safe_int(val, default: int = 0) -> int:
+    try:
+        if val is None:
+            return default
+        return int(float(val))
+    except (ValueError, TypeError):
+        return default
 
 
-def parse_level_from_text(text: str) -> int:
-    s = str(text or "").strip()
-    m = re.search(r"(?:lv\.?|t|等級)\s*([1-6])\b", s, re.IGNORECASE)
-    if m:
-        return int(m.group(1))
-    m2 = re.search(r"([1-6])\s*(?:級|階)", s)
-    if m2:
-        return int(m2.group(1))
-    if re.fullmatch(r"[1-6]", s):
-        return int(s)
-    return 0
+# ===================== 1. 拉取 Garena 實價大盤 JSON =====================
+def fetch_garena_dashboard() -> list[dict]:
+    print(f"📡 正在讀取 Garena 實價接口：{DASHBOARD_API_URL}", flush=True)
+    res = requests.get(DASHBOARD_API_URL, headers=HEADERS, timeout=(10, 25))
+    if res.status_code != 200:
+        raise RuntimeError(f"API 回傳 HTTP {res.status_code}：{res.text[:200]}")
 
+    payload = res.json()
+    raw_data = payload.get("data")
+    if not isinstance(raw_data, dict):
+        raise RuntimeError("API 回傳格式異常：找不到 data 欄位")
 
-def estimate_base_price(current_price: float, delta_val: float, is_pct: bool) -> float:
-    if current_price <= 0 or delta_val == 0:
-        return current_price
-    if is_pct:
-        factor = 1.0 + (delta_val / 100.0)
-        if factor > 0.15:
-            return current_price / factor
-        return current_price
-    base = current_price - delta_val
-    return base if base > 0 else current_price
+    enriched = []
+    seen = set()
 
-
-# ===================== 1A. 從攔截到的 JSON API 智慧提取彈藥 =====================
-NAME_KEYS = ("name_tw", "zh_tw", "zh_name", "nameTw", "item_name", "itemName", "name", "title")
-PRICE_KEYS = ("price", "current_price", "currentPrice", "avg_price", "avgPrice", "latest_price", "latestPrice", "market_price", "marketPrice", "value")
-LEVEL_KEYS = ("level", "grade", "tier", "rarity", "quality", "lv")
-
-
-def pick_first_key(obj: dict, keys: tuple):
-    for k in keys:
-        if k in obj and obj[k] not in (None, ""):
-            return obj[k]
-    return None
-
-
-def extract_items_from_json_blob(blob, depth: int = 0) -> list[dict]:
-    if depth > 5 or blob is None:
-        return []
-
-    best = []
-    if isinstance(blob, list):
-        parsed = []
-        for elem in blob:
-            if not isinstance(elem, dict):
-                continue
-            raw_name = pick_first_key(elem, NAME_KEYS)
-            raw_price = pick_first_key(elem, PRICE_KEYS)
-            if isinstance(raw_name, dict):
-                raw_name = raw_name.get("zh-TW") or raw_name.get("tw") or raw_name.get("zh") or raw_name.get("en")
-            if not isinstance(raw_name, str) or len(raw_name.strip()) < 2:
-                continue
-            price_val = parse_number(str(raw_price)) if raw_price is not None else 0.0
-            if price_val <= 0:
+    for category, bullet_list in raw_data.items():
+        if not isinstance(bullet_list, list):
+            continue
+        for item in bullet_list:
+            if not isinstance(item, dict):
                 continue
 
-            raw_level = pick_first_key(elem, LEVEL_KEYS)
-            level_val = parse_level_from_text(str(raw_level)) if raw_level is not None else 0
+            name = str(item.get("bullet_name") or "").strip()
+            price = safe_float(item.get("current_price"))
+            if not name or price <= 0 or name in seen:
+                continue
+            seen.add(name)
 
-            c1 = parse_number(str(elem.get("change_1d") or elem.get("change1d") or elem.get("day_change") or elem.get("diff_1d") or 0))
-            c7 = parse_number(str(elem.get("change_7d") or elem.get("change7d") or elem.get("week_change") or elem.get("diff_7d") or 0))
-            c30 = parse_number(str(elem.get("change_30d") or elem.get("change30d") or elem.get("month_change") or elem.get("diff_30d") or 0))
+            level = safe_int(item.get("tier"))
+            stack_size = safe_int(item.get("stack_size"), 60)
 
-            parsed.append({
-                "name": raw_name.strip(),
-                "price": round(price_val, 2),
-                "change_1d": round(c1, 2),
-                "change_7d": round(c7, 2),
-                "change_30d": round(c30, 2),
-                "change_is_pct": False,
-                "level": level_val,
+            # 採用 72 小時 P85 作為實戰保守賣價（若缺值依序降級）
+            target_sell = (
+                safe_float(item.get("p85_72h"))
+                or safe_float(item.get("p85_7d"))
+                or safe_float(item.get("p85_24h"))
+                or safe_float(item.get("max_72h"))
+                or price
+            )
+
+            breakeven_sell = math.ceil(price / NET_MULTIPLIER)
+
+            # 嚴格依 13.5% 稅後計算每發淨利與 ROI（單格利潤一併算好供 AI 參考）
+            est_net_profit = round(target_sell * NET_MULTIPLIER - price, 1)
+            est_net_roi_pct = round((est_net_profit / price) * 100, 1) if price > 0 else 0.0
+            profit_per_slot = round(est_net_profit * stack_size, 0)
+
+            # 估算近 7 日常態均價（結合 12h/24h/3d/7d 與 72h P70）
+            ref_prices = [
+                v for v in (
+                    safe_float(item.get("price_12h")),
+                    safe_float(item.get("price_24h")),
+                    safe_float(item.get("price_3d")),
+                    safe_float(item.get("price_7d")),
+                    safe_float(item.get("p70_72h")),
+                )
+                if v > 0
+            ]
+            est_avg = round(sum(ref_prices) / len(ref_prices), 1) if ref_prices else price
+            vs_avg_pct = round(((price - est_avg) / est_avg) * 100, 1) if est_avg > 0 else 0.0
+
+            pos_24h = safe_float(item.get("position_24h"), 50.0)
+            pos_72h = safe_float(item.get("position_72h"), pos_24h)
+            pos_7d = safe_float(item.get("position_7d"), pos_72h)
+
+            enriched.append({
+                "name": name,
+                "category": category,
+                "level": level,
+                "stack_size": stack_size,
+                "price": round(price, 1),
+                "breakeven_sell": breakeven_sell,
+                "target_sell": round(target_sell, 1),
+                "est_avg": est_avg,
+                "vs_avg_pct": vs_avg_pct,
+                "est_net_profit": est_net_profit,
+                "est_net_roi_pct": est_net_roi_pct,
+                "profit_per_slot": profit_per_slot,
+                "position_24h": round(pos_24h, 1),
+                "position_72h": round(pos_72h, 1),
+                "position_7d": round(pos_7d, 1),
+                "change_12h": safe_float(item.get("change_12h")),
+                "change_24h": safe_float(item.get("change_24h")),
+                "change_7d": safe_float(item.get("change_7d")),
+                "bounces_72h": safe_int(item.get("bounces_72h")),
+                "turnover": str(item.get("turnover_24h_label") or "未知"),
+                "safety_gate": str(item.get("safety_gate") or "NORMAL"),
+                "safety_warning": str(item.get("safety_warning") or ""),
+                "restock_in_hours": safe_float(item.get("restock_in_hours"), -99.0),
+                "trade_score": safe_float(item.get("trade_score")),
             })
-        if len(parsed) >= 5:
-            return parsed
 
-        for elem in blob[:20]:
-            sub = extract_items_from_json_blob(elem, depth + 1)
-            if len(sub) > len(best):
-                best = sub
-        return best
-
-    if isinstance(blob, dict):
-        for v in blob.values():
-            sub = extract_items_from_json_blob(v, depth + 1)
-            if len(sub) > len(best):
-                best = sub
-    return best
+    print(f"✅ 成功讀取 {len(enriched)} 款 Garena 彈藥即時行情。\n", flush=True)
+    return enriched
 
 
-# ===================== 1B. 從瀏覽器渲染後的 DOM 表格智慧提取彈藥 =====================
-def extract_rows_from_page(page) -> list[list[str]]:
-    return page.evaluate(
-        """() => {
-            const out = [];
-            let rows = Array.from(document.querySelectorAll('table tbody tr'));
-            if (rows.length === 0) rows = Array.from(document.querySelectorAll('table tr'));
-            if (rows.length === 0) rows = Array.from(document.querySelectorAll('[role="row"]'));
-            for (const r of rows) {
-                const cells = Array.from(r.querySelectorAll('td, [role="cell"], [role="gridcell"]'))
-                    .map(el => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim());
-                if (cells.length > 0) out.push(cells);
-            }
-            return out;
-        }"""
-    )
-
-
-def parse_dom_rows(raw_rows: list[list[str]]) -> list[dict]:
-    items = []
-    for raw_cells in raw_rows:
-        # 過濾掉純圖片圖示造成的空白格
-        cells = [c for c in raw_cells if c]
-        if len(cells) < 2:
-            continue
-
-        # 跳過表頭列
-        row_joined = " ".join(cells).lower()
-        if any(h in row_joined for h in ("名稱", "item name", "價格", "24h", "7d")) and not re.search(r"\d{2,}", row_joined):
-            continue
-
-        # 找出物品名稱：第一個包含中文或英文字母且非純標籤的欄位
-        name = ""
-        name_idx = -1
-        for idx, c in enumerate(cells):
-            if re.search(r"[\u4e00-\u9fffA-Za-z]", c) and not re.fullmatch(r"(?:lv\.?\s*\d+|t\d+|ammo|彈藥|[+\-]?\d+(?:\.\d+)?%)", c, re.IGNORECASE):
-                name = c
-                name_idx = idx
-                break
-
-        if not name or name_idx < 0:
-            continue
-
-        rest = cells[name_idx + 1:]
-        price = 0.0
-        price_idx = -1
-        level = parse_level_from_text(name)
-
-        # 尋找價格（不含 % 且不是純等級標籤的第一個正數）
-        for idx, c in enumerate(rest):
-            if "%" in c:
-                continue
-            lv_check = parse_level_from_text(c)
-            if lv_check > 0 and re.search(r"(?:lv|級|階|t)", c, re.IGNORECASE):
-                level = lv_check
-                continue
-            val = parse_number(c)
-            if val > 0:
-                price = val
-                price_idx = idx
-                break
-
-        if price <= 0:
-            continue
-
-        # 解析剩餘欄位中的漲跌與等級
-        changes = []
-        change_is_pct = False
-        for idx, c in enumerate(rest):
-            if idx == price_idx:
-                continue
-            lv = parse_level_from_text(c)
-            if lv > 0 and (re.search(r"(?:lv|級|階|t)", c, re.IGNORECASE) or (re.fullmatch(r"[1-6]", c) and len(changes) >= 1)):
-                if level == 0:
-                    level = lv
-                continue
-            if re.search(r"\d", c):
-                val, is_pct = parse_change_cell(c)
-                if is_pct:
-                    change_is_pct = True
-                changes.append(val)
-
-        c1 = changes[0] if len(changes) > 0 else 0.0
-        c7 = changes[1] if len(changes) > 1 else 0.0
-        c30 = changes[2] if len(changes) > 2 else 0.0
-
-        items.append({
-            "name": name,
-            "price": round(price, 2),
-            "change_1d": round(c1, 2),
-            "change_7d": round(c7, 2),
-            "change_30d": round(c30, 2),
-            "change_is_pct": change_is_pct,
-            "level": level,
-        })
-
-    return items
-
-
-# ===================== 1. 主爬蟲入口（Playwright 真實瀏覽器） =====================
-def scrape_deltaforce_ammo(max_pages: int = 12) -> list[dict]:
-    items_by_name = {}
-    captured_jsons = []
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            locale="zh-TW",
-            viewport={"width": 1440, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/128.0.0.0 Safari/537.36"
-            ),
-        )
-        page = context.new_page()
-
-        def handle_response(response):
-            try:
-                ct = (response.headers.get("content-type") or "").lower()
-                if response.status == 200 and "json" in ct:
-                    data = response.json()
-                    captured_jsons.append((response.url, data))
-            except Exception:
-                pass
-
-        page.on("response", handle_response)
-
-        print(f"🌐 正在啟動無頭瀏覽器開啟：{BASE_AMMO_URL}", flush=True)
-        try:
-            page.goto(BASE_AMMO_URL, wait_until="networkidle", timeout=45000)
-        except Exception as e:
-            print(f"⚠️ 等待 networkidle 超時（繼續檢查已渲染內容）：{e}", flush=True)
-
-        # 額外等待前端表格或資料掛載完成
-        try:
-            page.wait_for_selector("table tbody tr, [role='row']", timeout=12000)
-        except Exception:
-            pass
-        page.wait_for_timeout(2500)
-
-        # 優先檢查攔截到的背景 JSON API（若直接拿到全量資料最準確）
-        for api_url, blob in captured_jsons:
-            extracted = extract_items_from_json_blob(blob)
-            if len(extracted) >= 10:
-                print(f"🎯 從背景 JSON API 成功攔截 {len(extracted)} 款彈藥：{api_url}", flush=True)
-                for it in extracted:
-                    items_by_name[it["name"]] = it
-
-        # 若背景 API 未直接拿到全量，從渲染後的真實 DOM 逐頁抓取
-        if len(items_by_name) < 10:
-            prev_sig = None
-            for page_idx in range(1, max_pages + 1):
-                raw_rows = extract_rows_from_page(page)
-                parsed = parse_dom_rows(raw_rows)
-                print(f"📡 DOM 第 {page_idx} 頁：偵測到 {len(raw_rows)} 列 ➔ 解析出 {len(parsed)} 款彈藥", flush=True)
-
-                if not parsed:
-                    break
-
-                sig = tuple(x["name"] for x in parsed)
-                if sig == prev_sig:
-                    print("   ➔ 與上一頁相同，停止翻頁。", flush=True)
-                    break
-                prev_sig = sig
-
-                for it in parsed:
-                    items_by_name[it["name"]] = it
-
-                # 嘗試點擊「下一頁」按鈕
-                next_clicked = False
-                next_selectors = [
-                    "button:has-text('下一頁')",
-                    "button:has-text('Next')",
-                    "a:has-text('下一頁')",
-                    "a:has-text('Next')",
-                    "button[aria-label*='next' i]",
-                    "a[aria-label*='next' i]",
-                    "button:has-text('›')",
-                    "button:has-text('>')",
-                ]
-                for sel in next_selectors:
-                    loc = page.locator(sel).first
-                    try:
-                        if loc.count() > 0 and loc.is_visible() and loc.is_enabled():
-                            loc.click(timeout=5000)
-                            page.wait_for_timeout(2000)
-                            next_clicked = True
-                            break
-                    except Exception:
-                        continue
-
-                if not next_clicked:
-                    break
-
-        # 若仍為 0 筆，印出詳細頁面診斷情報方便一次定位
-        if len(items_by_name) == 0:
-            print("\n🔍 ===== 診斷情報（供排查網站結構）=====", flush=True)
-            print(f"最終網址：{page.url}", flush=True)
-            print(f"頁面標題：{page.title()}", flush=True)
-            print(f"攔截到 JSON 請求數：{len(captured_jsons)}", flush=True)
-            for u, _ in captured_jsons[:10]:
-                print(f"  - JSON URL: {u}", flush=True)
-            sample_rows = extract_rows_from_page(page)
-            print(f"原始表格列數：{len(sample_rows)}", flush=True)
-            for idx, r in enumerate(sample_rows[:5]):
-                print(f"  - Row {idx}: {r}", flush=True)
-            body_preview = page.evaluate("() => (document.body.innerText || '').slice(0, 700)")
-            print(f"頁面可見文字前段：\n{body_preview}", flush=True)
-            print("=========================================\n", flush=True)
-
-        browser.close()
-
-    results = list(items_by_name.values())
-    print(f"✅ 共採集完成 {len(results)} 款彈藥行情。\n", flush=True)
-    return results
-
-
-# ===================== 2. Cloudflare KV 讀寫工具 =====================
-def get_kv_config():
+# ===================== 2. Cloudflare KV 寫入工具 =====================
+def kv_put_json(key: str, data) -> bool:
     account_id = os.environ.get("CF_ACCOUNT_ID")
     namespace_id = os.environ.get("CF_KV_NAMESPACE_ID")
     api_token = os.environ.get("CF_API_TOKEN")
     if not all([account_id, namespace_id, api_token]):
-        return None
-    return account_id, namespace_id, api_token
-
-
-def kv_get_json(key: str, default):
-    cfg = get_kv_config()
-    if not cfg:
-        return default
-    account_id, namespace_id, api_token = cfg
-    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/storage/kv/namespaces/{namespace_id}/values/{key}"
-    try:
-        res = requests.get(url, headers={"Authorization": f"Bearer {api_token}"}, timeout=20)
-        if res.status_code == 200:
-            return res.json()
-    except Exception as e:
-        print(f"⚠️ 讀取 KV [{key}] 異常：{e}", flush=True)
-    return default
-
-
-def kv_put_json(key: str, data) -> bool:
-    cfg = get_kv_config()
-    if not cfg:
         print(f"⚠️ 缺少 Cloudflare KV 憑證，跳過寫入 [{key}]。", flush=True)
         return False
-    account_id, namespace_id, api_token = cfg
+
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/storage/kv/namespaces/{namespace_id}/values/{key}"
     headers = {
         "Authorization": f"Bearer {api_token}",
@@ -397,116 +166,15 @@ def kv_put_json(key: str, data) -> bool:
     return False
 
 
-# ===================== 3. 更新歷史紀錄 & 計算 13% 稅後指標 =====================
-def update_history_and_compute_metrics(items: list[dict], history: dict, now_tw: datetime) -> tuple[dict, list[dict]]:
-    now_unix = int(now_tw.timestamp())
-    weekday = now_tw.weekday()  # 0=週一 ... 6=週日
-    hour = now_tw.hour
-
-    if not isinstance(history, dict):
-        history = {}
-
-    enriched = []
-
-    for it in items:
-        name = it["name"]
-        price = float(it["price"])
-        c1 = float(it.get("change_1d", 0.0))
-        c7 = float(it.get("change_7d", 0.0))
-        c30 = float(it.get("change_30d", 0.0))
-        is_pct = bool(it.get("change_is_pct", False))
-        level = int(it.get("level", 0))
-
-        # 追加本次快照至歷史 K 線（格式：[unix_ts, price, weekday, hour]）
-        pts = history.get(name, [])
-        if not isinstance(pts, list):
-            pts = []
-        if not pts or (now_unix - pts[-1][0]) >= 1800:
-            pts.append([now_unix, round(price, 1), weekday, hour])
-            if len(pts) > MAX_HISTORY_POINTS:
-                pts = pts[-MAX_HISTORY_POINTS:]
-        history[name] = pts
-
-        # 由站方 1D / 7D / 30D 漲跌反推歷史基準價（支援金額與百分比）
-        ref_prices = [price]
-        for delta in (c1, c7, c30):
-            base_p = estimate_base_price(price, delta, is_pct)
-            if base_p > 0:
-                ref_prices.append(base_p)
-
-        hist_prices = [p[1] for p in pts if isinstance(p, list) and len(p) >= 2 and p[1] > 0]
-        all_prices = ref_prices + hist_prices
-
-        est_low = min(all_prices)
-        est_high = max(all_prices)
-        est_avg = sum(all_prices) / len(all_prices)
-
-        if est_high > est_low:
-            percentile = round((price - est_low) / (est_high - est_low) * 100, 1)
-        else:
-            percentile = 50.0
-
-        # 13% 手續費損益兩平賣價
-        breakeven_sell = math.ceil(price / NET_MULTIPLIER)
-
-        # 保守目標賣價
-        if len(hist_prices) >= 12:
-            sorted_hp = sorted(hist_prices)
-            p85_idx = min(len(sorted_hp) - 1, int(len(sorted_hp) * 0.85))
-            target_sell = max(sorted_hp[p85_idx], round(est_high * 0.92, 1))
-        else:
-            target_sell = round(est_high * 0.95, 1)
-
-        net_after_tax = target_sell * NET_MULTIPLIER
-        est_net_profit = round(net_after_tax - price, 1)
-        est_net_roi_pct = round((est_net_profit / price) * 100, 1) if price > 0 else 0.0
-        vs_avg_pct = round(((price - est_avg) / est_avg) * 100, 1) if est_avg > 0 else 0.0
-
-        best_buy_hour = None
-        best_sell_hour = None
-        if len(pts) >= 24:
-            hour_buckets = {}
-            for p in pts:
-                h = p[3]
-                hour_buckets.setdefault(h, []).append(p[1])
-            hour_avgs = {h: sum(v) / len(v) for h, v in hour_buckets.items() if len(v) >= 2}
-            if hour_avgs:
-                best_buy_hour = min(hour_avgs, key=hour_avgs.get)
-                best_sell_hour = max(hour_avgs, key=hour_avgs.get)
-
-        enriched.append({
-            "name": name,
-            "level": level,
-            "price": round(price, 1),
-            "change_1d": round(c1, 1),
-            "change_7d": round(c7, 1),
-            "change_30d": round(c30, 1),
-            "breakeven_sell": breakeven_sell,
-            "target_sell": round(target_sell, 1),
-            "est_low": round(est_low, 1),
-            "est_high": round(est_high, 1),
-            "est_avg": round(est_avg, 1),
-            "percentile": percentile,
-            "vs_avg_pct": vs_avg_pct,
-            "est_net_profit": est_net_profit,
-            "est_net_roi_pct": est_net_roi_pct,
-            "samples": len(pts),
-            "best_buy_hour": best_buy_hour,
-            "best_sell_hour": best_sell_hour,
-        })
-
-    return history, enriched
-
-
-# ===================== 4. 篩選候選標的並交給 Gemini 產出操盤建議 =====================
+# ===================== 3. 量化篩選 + Gemini 操盤報告 =====================
 def build_fallback_report(flip_top: list, self_use_top: list, sell_top: list, now_tw: datetime) -> dict:
     return {
         "updated_at": int(now_tw.timestamp()),
         "updated_str": now_tw.strftime("%Y-%m-%d %H:%M"),
-        "source": "數學模型備援（未啟用 AI）",
+        "source": "Garena 實價量化模型（備援）",
         "market_summary": (
-            f"目前時間為台灣 {WEEKDAY_ZH[now_tw.weekday()]} {now_tw.strftime('%H:%M')}。"
-            "系統已依 13% 手續費門檻（賣價需比買價高至少 15% 才打平）篩選出以下重點彈藥。"
+            f"台灣時間 {WEEKDAY_ZH[now_tw.weekday()]} {now_tw.strftime('%H:%M')}。"
+            "已依 Garena 實價與 72 小時 P85 賣價扣除 13.5% 手續費完成篩選。"
         ),
         "flip_picks": [
             {
@@ -515,7 +183,7 @@ def build_fallback_report(flip_top: list, self_use_top: list, sell_top: list, no
                 "buy_price": x["price"],
                 "target_sell": x["target_sell"],
                 "roi_pct": x["est_net_roi_pct"],
-                "reason": f"現價落在區間 {x['percentile']}% 分位，反彈至目標價扣 13% 稅後預估淨利 {x['est_net_roi_pct']}%。",
+                "reason": f"72h 水位 {x['position_72h']}%、回彈 {x['bounces_72h']} 次，扣稅後每格約賺 {int(x['profit_per_slot'])}。",
             }
             for x in flip_top[:4]
         ],
@@ -524,8 +192,8 @@ def build_fallback_report(flip_top: list, self_use_top: list, sell_top: list, no
                 "name": x["name"],
                 "level": x["level"],
                 "buy_price": x["price"],
-                "discount_pct": abs(x["vs_avg_pct"]),
-                "reason": f"低於均價 {abs(x['vs_avg_pct'])}%，自用囤貨可完全避開 13% 賣出稅。",
+                "discount_pct": round(abs(min(x["vs_avg_pct"], 0.0)), 1),
+                "reason": f"72h 水位僅 {x['position_72h']}%，低於均價 {abs(min(x['vs_avg_pct'], 0.0))}%，自用免稅省很大。",
             }
             for x in self_use_top[:4]
         ],
@@ -534,35 +202,62 @@ def build_fallback_report(flip_top: list, self_use_top: list, sell_top: list, no
                 "name": x["name"],
                 "level": x["level"],
                 "sell_price": x["price"],
-                "reason": f"現價處於 {x['percentile']}% 高位（高於均價 +{x['vs_avg_pct']}%），適合逢高出清。",
+                "reason": f"72h 水位高達 {x['position_72h']}%（高於均價 +{max(x['vs_avg_pct'], 0.0)}%），適合逢高出清。",
             }
             for x in sell_top[:4]
         ],
-        "risk_note": "本行情採集自國際服拍賣行大盤；Garena 服單價可能存在折溢價，掛單前請核對局內市價並避開過高溢價累進稅。",
+        "risk_note": "已計入約 13.5% 上架與成交稅；若標示波動偏高或即將系統補貨，請分批掛單避免壓價。",
     }
 
 
 def generate_ai_report(enriched: list[dict], now_tw: datetime) -> dict:
+    # 聚焦實戰主流 Lv.3 ~ Lv.6 子彈
     tradable = [x for x in enriched if x["level"] >= 3 and x["price"] >= 100]
     if not tradable:
-        tradable = [x for x in enriched if x["price"] >= 100]
+        tradable = enriched
 
-    flip_candidates = sorted(
-        [x for x in tradable if x["est_net_roi_pct"] >= 6.0 and x["percentile"] <= 55.0],
-        key=lambda x: (x["est_net_roi_pct"], x["level"]),
+    # 1. 抄底倒賣候選：嚴格要求扣 13.5% 稅後淨利 > 0 且位於 72h 中低位
+    flip_candidates = [
+        x for x in tradable
+        if x["est_net_roi_pct"] >= 2.5
+        and x["est_net_profit"] >= 10
+        and x["position_72h"] <= 45.0
+    ]
+    if len(flip_candidates) < 3:
+        flip_candidates = [
+            x for x in tradable
+            if x["est_net_roi_pct"] > 0.5 and x["position_72h"] <= 55.0
+        ]
+    flip_candidates.sort(
+        key=lambda x: (
+            1 if x["safety_gate"] == "PASS" else 0,
+            x["est_net_roi_pct"],
+            x["profit_per_slot"],
+        ),
         reverse=True,
-    )[:8]
+    )
+    flip_candidates = flip_candidates[:8]
 
-    self_use_candidates = sorted(
-        [x for x in tradable if x["vs_avg_pct"] <= -7.0],
-        key=lambda x: x["vs_avg_pct"],
-    )[:8]
+    # 2. 自用囤貨候選：優先挑 Lv.4~6 或明顯跌破均價／處於 72h 低檔區（免賣出稅）
+    self_use_candidates = [
+        x for x in tradable
+        if x["level"] >= 4 and (x["vs_avg_pct"] <= -5.0 or x["position_72h"] <= 20.0)
+    ]
+    if len(self_use_candidates) < 4:
+        self_use_candidates = [
+            x for x in tradable
+            if x["vs_avg_pct"] <= -5.0 or x["position_72h"] <= 20.0
+        ]
+    self_use_candidates.sort(key=lambda x: (x["vs_avg_pct"], x["position_72h"]))
+    self_use_candidates = self_use_candidates[:8]
 
-    sell_candidates = sorted(
-        [x for x in tradable if x["vs_avg_pct"] >= 12.0 or (x["percentile"] >= 80.0 and x["change_7d"] > 0)],
-        key=lambda x: (x["vs_avg_pct"], x["percentile"]),
-        reverse=True,
-    )[:8]
+    # 3. 逢高出清候選：位於 72h/24h 高檔區（>= 80%）且高於均價
+    sell_candidates = [
+        x for x in tradable
+        if x["position_72h"] >= 80.0 or (x["position_24h"] >= 88.0 and x["vs_avg_pct"] >= 5.0)
+    ]
+    sell_candidates.sort(key=lambda x: (x["position_72h"], x["vs_avg_pct"]), reverse=True)
+    sell_candidates = sell_candidates[:8]
 
     fallback = build_fallback_report(flip_candidates, self_use_candidates, sell_candidates, now_tw)
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -571,14 +266,17 @@ def generate_ai_report(enriched: list[dict], now_tw: datetime) -> dict:
         return fallback
 
     prompt = (
-        f"你是《三角洲行動 (Delta Force)》資深拍賣行子彈操盤分析師。"
+        f"你是《三角洲行動 (Delta Force)》Garena 服拍賣行彈藥操盤分析師。"
         f"目前台灣時間：{now_tw.strftime('%Y-%m-%d %H:%M')}（{WEEKDAY_ZH[now_tw.weekday()]}）。\n"
-        f"請嚴格根據以下 Python 預先算好的候選子彈數據（皆已計入原生交易行 13% 手續費，需漲幅超過 15% 才打平），"
-        f"產出一份繁體中文 JSON 操盤報告，只講具體數字與操作建議，絕不捏造沒在數據裡的子彈或價格：\n\n"
-        f"【候選 1：抄底倒賣（扣 13% 稅仍有預期淨利）】\n{json.dumps(flip_candidates, ensure_ascii=False)}\n\n"
-        f"【候選 2：自用抄底囤貨（低於均價、免 13% 賣出稅）】\n{json.dumps(self_use_candidates, ensure_ascii=False)}\n\n"
-        f"【候選 3：逢高出清警戒（相對高位）】\n{json.dumps(sell_candidates, ensure_ascii=False)}\n\n"
-        f"請從各分類挑選最值得操作的 3～4 款（若該分類候選為空則回傳空陣列 []），並結合目前是平日還是週末、凌晨還是晚間，給出簡短精準的買賣時機建議。"
+        f"以下皆為 Garena 實價大盤計算出的候選數據（目標賣價為 72 小時 P85 價，已扣除 13.5% 手續費，含回彈次數 bounces_72h、流通度 turnover、安全風控 safety_gate 與系統補貨倒數 restock_in_hours）。\n"
+        f"請嚴格根據以下數據產出精煉的繁體中文 JSON 報告，絕不捏造數據外的子彈或價格；每個標的的 reason 控制在 40 字以內、直講關鍵重點：\n\n"
+        f"【候選 1：抄底倒賣（扣 13.5% 稅仍有正利潤）】\n{json.dumps(flip_candidates, ensure_ascii=False)}\n\n"
+        f"【候選 2：自用抄底囤貨（低於均價或處於 72h 低點、免賣出稅）】\n{json.dumps(self_use_candidates, ensure_ascii=False)}\n\n"
+        f"【候選 3：逢高出清警戒（72h 高位）】\n{json.dumps(sell_candidates, ensure_ascii=False)}\n\n"
+        f"規則：\n"
+        f"1. 各分類挑選最值得操作的 3～4 款（若候選為空則回傳 []）。\n"
+        f"2. 倒賣優先挑 safety_gate=PASS、回彈次數高且單格利潤佳的標的；若為 CAUTION 或 restock_in_hours 在 0~2 小時內，請在 reason 簡短提醒。\n"
+        f"3. discount_pct 請填寫正數百分比（取 vs_avg_pct 的絕對折價幅，若未低於均價則填 0）。"
     )
 
     schema = {
@@ -662,8 +360,8 @@ def generate_ai_report(enriched: list[dict], now_tw: datetime) -> dict:
         report = json.loads(raw_text)
         report["updated_at"] = int(now_tw.timestamp())
         report["updated_str"] = now_tw.strftime("%Y-%m-%d %H:%M")
-        report["source"] = f"Gemini ({GEMINI_MODEL}) + 13% 稅後量化模型"
-        print("🤖 Gemini 子彈操盤報告產出成功！", flush=True)
+        report["source"] = f"Garena 實價 + Gemini ({GEMINI_MODEL})"
+        print("🤖 Gemini Garena 操盤報告產出成功！", flush=True)
         return report
 
     except Exception as e:
@@ -673,18 +371,19 @@ def generate_ai_report(enriched: list[dict], now_tw: datetime) -> dict:
 
 def main():
     now_tw = get_tw_now()
-    print(f"🚀 啟動三角洲行動彈藥行情與 AI 操盤分析（台灣時間 {now_tw.strftime('%Y-%m-%d %H:%M:%S')}）\n", flush=True)
+    print(f"🚀 啟動 Garena 三角洲彈藥分析（台灣時間 {now_tw.strftime('%Y-%m-%d %H:%M:%S')}）\n", flush=True)
 
-    items = scrape_deltaforce_ammo()
-    if not items:
-        print("❌ 未抓到任何彈藥資料，中止寫入以保護既有 KV 資料。", flush=True)
+    try:
+        enriched = fetch_garena_dashboard()
+    except Exception as e:
+        print(f"❌ 讀取 Garena 行情失敗：{e}", flush=True)
         sys.exit(1)
 
-    history = kv_get_json("df_ammo_history", {})
-    updated_history, enriched = update_history_and_compute_metrics(items, history, now_tw)
+    if not enriched:
+        print("❌ 未取得任何彈藥資料，中止寫入以保護既有 KV。", flush=True)
+        sys.exit(1)
 
     enriched.sort(key=lambda x: (x["level"], x["price"]), reverse=True)
-
     report = generate_ai_report(enriched, now_tw)
 
     latest_payload = {
@@ -695,10 +394,9 @@ def main():
     }
 
     kv_put_json("df_ammo_latest", latest_payload)
-    kv_put_json("df_ammo_history", updated_history)
     kv_put_json("df_ammo_report", report)
 
-    print("\n📊 操盤快報預覽：", flush=True)
+    print("\n📊 Garena 操盤快報預覽：", flush=True)
     print(report.get("market_summary", ""), flush=True)
     print(f"  - 抄底倒賣推薦：{len(report.get('flip_picks', []))} 款", flush=True)
     print(f"  - 自用囤貨推薦：{len(report.get('self_use_picks', []))} 款", flush=True)
