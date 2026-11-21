@@ -1,8 +1,8 @@
-name: Delta Force Ammo Tracker & AI Advisor
+name: Delta Force Garena Ammo Advisor
 
 on:
   schedule:
-    - cron: '15 */2 * * *' # 每 2 小時自動採集與分析一次（錯開整點高峰）
+    - cron: '15 */2 * * *' # 每 2 小時禮貌拉取一次（一天僅 12 次 GET）
   workflow_dispatch:
 
 concurrency:
@@ -22,13 +22,11 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Dependencies & Chromium
+      - name: Install Dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install requests playwright
-          python -m playwright install --with-deps chromium
+          pip install requests
 
-      - name: Run Delta Force Ammo Scraper & AI Analysis
+      - name: Run Garena Ammo Advisor
         env:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
